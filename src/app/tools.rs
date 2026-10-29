@@ -138,7 +138,7 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(150));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(16.0).color(ACCENT));
+                spinner(ui, 16.0);
                 ui.label(RichText::new("Comparing files").font(font_bold(14.0)).color(TEXT));
             });
             ui.add_space(4.0);
@@ -227,7 +227,7 @@ impl App {
             ui.label(RichText::new(format!("{}  {} could not be read", icon::LOCK_SIMPLE, util::count_of(res.unreadable, "file"))).size(11.5).color(TEXT_FAINT));
         }
         ui.label(
-            RichText::new("Hard links are already left out. On btrfs or XFS, copies made with reflinks share space and free nothing when deleted.")
+            RichText::new("Hard links are already left out. On btrfs, XFS or APFS, copies made with reflinks or clones share space and free nothing when deleted.")
                 .size(11.0)
                 .color(TEXT_FAINT),
         );

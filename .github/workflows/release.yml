@@ -1,5 +1,5 @@
-# Builds the Linux packages and the Windows program, and tests them on
-# several Linux distributions and on Windows.
+# Builds the Linux packages, the Windows program and the macOS app, and tests
+# them on several Linux distributions, on Windows and on macOS.
 #
 # - On every push and pull request: build and test.
 # - When a tag like v0.4.0 is pushed: also create a GitHub release with the
@@ -87,6 +87,28 @@ jobs:
           name: windows
           path: dist/*
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Update Rust
+        run: rustup update stable --no-self-update
+
+      - name: Run tests
+        run: cargo test --release --locked
+
+      - name: Build the app
+        run: bash packaging/macos/build-app.sh
+
+      - name: Check that it runs
+        run: ./dist/Spacemapper.app/Contents/MacOS/spacemapper --version
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos
+          path: dist/*.zip
+
   test:
     needs: build
     runs-on: ubuntu-24.04
@@ -123,7 +145,7 @@ jobs:
           test -f /usr/share/icons/hicolor/256x256/apps/spacemapper.png
 
   release:
-    needs: [build, test, windows]
+    needs: [build, test, windows, macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
@@ -134,6 +156,10 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           name: windows
+          path: dist
+      - uses: actions/download-artifact@v7
+        with:
+          name: macos
           path: dist
       - name: Checksums
         run: cd dist && rm -f SHA256SUMS && sha256sum * > SHA256SUMS

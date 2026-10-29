@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Helpers: formatting, drives and mounts, free space, file metadata,
 //! opening files, and per-user folders. Everything that differs between
-//! Linux and Windows lives here, in the `imp` modules at the bottom.
+//! Linux, macOS and Windows lives here, in the `imp` modules at the bottom.
 //!
 //! The only external programs started from here are `gio`, `xdg-open` and
-//! `dbus-send` on Linux, and `explorer` on Windows (to show or open a file).
+//! `dbus-send` on Linux, `open` and `osascript` (the password dialog) on
+//! macOS, and `explorer` on Windows (to show or open a file).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,71 +190,6 @@ mod imp {
         format!("{:04}-{:02}-{:02} {:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min)
     }
 
-    fn unescape_mount(s: &str) -> String {
-        // /proc/self/mountinfo escapes space, tab, newline and backslash as \ooo
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            if b[i] == b'\\' && i + 3 < b.len() {
-                let oct = &b[i + 1..i + 4];
-                if oct.iter().all(|c| (b'0'..=b'7').contains(c)) {
-                    let v = (oct[0] - b'0') as u32 * 64 + (oct[1] - b'0') as u32 * 8 + (oct[2] - b'0') as u32;
-                    out.push(v as u8);
-                    i += 4;
-                    continue;
-                }
-            }
-            out.push(b[i]);
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    }
-
-    pub fn read_mounts() -> Vec<Mount> {
-        let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
-            return Vec::new();
-        };
-        let mut v = Vec::new();
-        for line in text.lines() {
-            let Some((left, right)) = line.split_once(" - ") else { continue };
-            let lf: Vec<&str> = left.split(' ').collect();
-            let rf: Vec<&str> = right.split(' ').collect();
-            if lf.len() < 5 || rf.len() < 2 {
-                continue;
-            }
-            v.push(Mount {
-                point: PathBuf::from(unescape_mount(lf[4])),
-                fstype: rf[0].to_string(),
-                source: unescape_mount(rf[1]),
-                options: lf.get(5).unwrap_or(&"").to_string(),
-            });
-        }
-        v
-    }
-
-    /// Pseudo filesystems that must never be scanned (they are not on any disk).
-    pub fn is_virtual_fs(fstype: &str) -> bool {
-        matches!(
-            fstype,
-            "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "securityfs"
-                | "debugfs" | "tracefs" | "pstore" | "bpf" | "mqueue" | "hugetlbfs"
-                | "configfs" | "fusectl" | "autofs" | "binfmt_misc" | "efivarfs"
-                | "rpc_pipefs" | "nsfs" | "selinuxfs" | "overlay" | "fuse.portal"
-                | "fuse.gvfsd-fuse" | "ramfs" | "nfsd"
-        )
-    }
-
-    /// Filesystems worth listing on the start screen.
-    pub fn is_listable_fs(m: &Mount) -> bool {
-        if is_virtual_fs(&m.fstype) || m.fstype == "tmpfs" || m.fstype == "squashfs" {
-            return false;
-        }
-        m.source.starts_with('/')
-            || matches!(m.fstype.as_str(), "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "virtiofs")
-            || m.fstype.starts_with("fuse.")
-    }
-
     pub fn fs_space(p: &Path) -> Option<Space> {
         let c = CString::new(p.as_os_str().as_bytes()).ok()?;
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -268,95 +204,12 @@ mod imp {
         })
     }
 
-    fn file_uri(p: &Path) -> String {
-        let mut s = String::from("file://");
-        for &b in p.as_os_str().as_bytes() {
-            let keep = b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~');
-            if keep {
-                s.push(b as char);
-            } else {
-                s.push_str(&format!("%{b:02X}"));
-            }
-        }
-        s
-    }
-
-    /// Open a file or folder with the default application. `gio open` is
-    /// tried first: outside GNOME and KDE (Hyprland, Sway, ...) `xdg-open`
-    /// searches all .desktop files with a shell script, which can take
-    /// seconds, while gio finds the application right away.
-    fn open_default(p: &Path) -> bool {
-        let quiet = |mut c: Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-        let mut gio = Command::new("gio");
-        gio.arg("open").arg(p);
-        if quiet(gio) {
-            return true;
-        }
-        let mut xdg = Command::new("xdg-open");
-        xdg.arg(p);
-        quiet(xdg)
-    }
-
-    pub fn open_path(p: &Path) {
-        let p = p.to_path_buf();
-        std::thread::spawn(move || {
-            open_default(&p);
-        });
-    }
-
-    /// Open the file manager with the item selected (FreeDesktop FileManager1
-    /// interface: Dolphin, Nautilus, Nemo, Thunar, ...). Falls back to opening
-    /// the containing folder.
-    pub fn show_in_file_manager(p: &Path) {
-        let uri = file_uri(p);
-        let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.to_path_buf());
-        std::thread::spawn(move || {
-            let ok = Command::new("dbus-send")
-                .args([
-                    "--session",
-                    "--print-reply",
-                    "--reply-timeout=4000",
-                    "--dest=org.freedesktop.FileManager1",
-                    "--type=method_call",
-                    "/org/freedesktop/FileManager1",
-                    "org.freedesktop.FileManager1.ShowItems",
-                    &format!("array:string:{uri}"),
-                    "string:",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !ok {
-                open_default(&parent);
-            }
-        });
-    }
-
     pub fn home_dir() -> PathBuf {
         std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
     }
 
-    fn xdg(var: &str, fallback: &str) -> PathBuf {
-        std::env::var_os(var)
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .unwrap_or_else(|| home_dir().join(fallback))
-    }
-
-    /// ~/.config/spacemapper
-    pub fn config_dir() -> PathBuf {
-        xdg("XDG_CONFIG_HOME", ".config").join("spacemapper")
-    }
-
-    /// ~/.local/state/spacemapper
-    pub fn state_dir() -> PathBuf {
-        xdg("XDG_STATE_HOME", ".local/state").join("spacemapper")
-    }
-
-    /// Never called on Unix: full access works through pkexec instead.
+    /// Never called on Unix: full access works through pkexec (macOS: sudo)
+    /// instead.
     pub fn relaunch_as_admin(_path: Option<&Path>) -> bool {
         false
     }
@@ -366,6 +219,394 @@ mod imp {
     }
 
     pub fn attach_console() {}
+
+    // Linux-specific helpers (and the other Unixes).
+    #[cfg(not(target_os = "macos"))]
+    mod linux {
+        use super::*;
+
+        fn unescape_mount(s: &str) -> String {
+            // /proc/self/mountinfo escapes space, tab, newline and backslash as \ooo
+            let b = s.as_bytes();
+            let mut out = Vec::with_capacity(b.len());
+            let mut i = 0;
+            while i < b.len() {
+                if b[i] == b'\\' && i + 3 < b.len() {
+                    let oct = &b[i + 1..i + 4];
+                    if oct.iter().all(|c| (b'0'..=b'7').contains(c)) {
+                        let v = (oct[0] - b'0') as u32 * 64 + (oct[1] - b'0') as u32 * 8 + (oct[2] - b'0') as u32;
+                        out.push(v as u8);
+                        i += 4;
+                        continue;
+                    }
+                }
+                out.push(b[i]);
+                i += 1;
+            }
+            String::from_utf8_lossy(&out).into_owned()
+        }
+
+        pub fn read_mounts() -> Vec<Mount> {
+            let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") else {
+                return Vec::new();
+            };
+            let mut v = Vec::new();
+            for line in text.lines() {
+                let Some((left, right)) = line.split_once(" - ") else { continue };
+                let lf: Vec<&str> = left.split(' ').collect();
+                let rf: Vec<&str> = right.split(' ').collect();
+                if lf.len() < 5 || rf.len() < 2 {
+                    continue;
+                }
+                v.push(Mount {
+                    point: PathBuf::from(unescape_mount(lf[4])),
+                    fstype: rf[0].to_string(),
+                    source: unescape_mount(rf[1]),
+                    options: lf.get(5).unwrap_or(&"").to_string(),
+                });
+            }
+            v
+        }
+
+        /// Pseudo filesystems that must never be scanned (they are not on any disk).
+        pub fn is_virtual_fs(fstype: &str) -> bool {
+            matches!(
+                fstype,
+                "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "securityfs"
+                    | "debugfs" | "tracefs" | "pstore" | "bpf" | "mqueue" | "hugetlbfs"
+                    | "configfs" | "fusectl" | "autofs" | "binfmt_misc" | "efivarfs"
+                    | "rpc_pipefs" | "nsfs" | "selinuxfs" | "overlay" | "fuse.portal"
+                    | "fuse.gvfsd-fuse" | "ramfs" | "nfsd"
+            )
+        }
+
+        /// Filesystems worth listing on the start screen.
+        pub fn is_listable_fs(m: &Mount) -> bool {
+            if is_virtual_fs(&m.fstype) || m.fstype == "tmpfs" || m.fstype == "squashfs" {
+                return false;
+            }
+            m.source.starts_with('/')
+                || matches!(m.fstype.as_str(), "nfs" | "nfs4" | "cifs" | "smb3" | "9p" | "virtiofs")
+                || m.fstype.starts_with("fuse.")
+        }
+
+        fn file_uri(p: &Path) -> String {
+            let mut s = String::from("file://");
+            for &b in p.as_os_str().as_bytes() {
+                let keep = b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~');
+                if keep {
+                    s.push(b as char);
+                } else {
+                    s.push_str(&format!("%{b:02X}"));
+                }
+            }
+            s
+        }
+
+        /// Open a file or folder with the default application. `gio open` is
+        /// tried first: outside GNOME and KDE (Hyprland, Sway, ...) `xdg-open`
+        /// searches all .desktop files with a shell script, which can take
+        /// seconds, while gio finds the application right away.
+        fn open_default(p: &Path) -> bool {
+            let quiet = |mut c: Command| c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+            let mut gio = Command::new("gio");
+            gio.arg("open").arg(p);
+            if quiet(gio) {
+                return true;
+            }
+            let mut xdg = Command::new("xdg-open");
+            xdg.arg(p);
+            quiet(xdg)
+        }
+
+        pub fn open_path(p: &Path) {
+            let p = p.to_path_buf();
+            std::thread::spawn(move || {
+                open_default(&p);
+            });
+        }
+
+        /// Open the file manager with the item selected (FreeDesktop FileManager1
+        /// interface: Dolphin, Nautilus, Nemo, Thunar, ...). Falls back to opening
+        /// the containing folder.
+        pub fn show_in_file_manager(p: &Path) {
+            let uri = file_uri(p);
+            let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.to_path_buf());
+            std::thread::spawn(move || {
+                let ok = Command::new("dbus-send")
+                    .args([
+                        "--session",
+                        "--print-reply",
+                        "--reply-timeout=4000",
+                        "--dest=org.freedesktop.FileManager1",
+                        "--type=method_call",
+                        "/org/freedesktop/FileManager1",
+                        "org.freedesktop.FileManager1.ShowItems",
+                        &format!("array:string:{uri}"),
+                        "string:",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    open_default(&parent);
+                }
+            });
+        }
+        fn xdg(var: &str, fallback: &str) -> PathBuf {
+            std::env::var_os(var)
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
+                .unwrap_or_else(|| home_dir().join(fallback))
+        }
+
+        /// ~/.config/spacemapper
+        pub fn config_dir() -> PathBuf {
+            xdg("XDG_CONFIG_HOME", ".config").join("spacemapper")
+        }
+
+        /// ~/.local/state/spacemapper
+        pub fn state_dir() -> PathBuf {
+            xdg("XDG_STATE_HOME", ".local/state").join("spacemapper")
+        }
+
+        /// Only macOS has Full Disk Access; elsewhere the app never asks for it.
+        pub fn has_full_disk_access() -> bool {
+            true
+        }
+
+        /// Never called outside macOS (see `has_full_disk_access`).
+        pub fn open_full_disk_access_settings() {}
+
+        /// Never called outside macOS (see `has_full_disk_access`).
+        pub fn reveal_app() {}
+
+        /// Mounts the scan never enters, even with "Other drives" on.
+        pub fn is_virtual_mount(m: &Mount) -> bool {
+            is_virtual_fs(&m.fstype)
+        }
+
+        /// Directories the scan treats as mount points and does not enter.
+        pub fn is_system_volume_dir(_scan_root: &Path, _p: &Path) -> bool {
+            false
+        }
+
+        /// What `may_enter` answers when the device changes but no mount entry
+        /// exists: a nested btrfs subvolume.
+        pub const ENTER_UNLISTED_DEVICES: bool = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    pub use linux::*;
+
+    // macOS: mount table from getmntinfo, APFS volume rules.
+    #[cfg(target_os = "macos")]
+    mod macos {
+        use super::*;
+        use std::ffi::CStr;
+
+        /// One mount from its `statfs` fields. `options` is a comma-joined
+        /// list: `rw` or `ro`, then `nobrowse`, `local`, `noatime`.
+        fn mount_from_parts(point: &str, source: &str, fstype: &str, flags: u32) -> Mount {
+            let has = |f: libc::c_int| flags & f as u32 != 0;
+            let mut opts = vec![if has(libc::MNT_RDONLY) { "ro" } else { "rw" }];
+            if has(libc::MNT_DONTBROWSE) {
+                opts.push("nobrowse");
+            }
+            if has(libc::MNT_LOCAL) {
+                opts.push("local");
+            }
+            if has(libc::MNT_NOATIME) {
+                opts.push("noatime");
+            }
+            Mount { point: PathBuf::from(point), source: source.to_string(), fstype: fstype.to_string(), options: opts.join(",") }
+        }
+
+        /// The mount table from `getmntinfo`. The buffer belongs to the
+        /// system and is reused by the next call, so it is copied here.
+        pub fn read_mounts() -> Vec<Mount> {
+            let mut ptr: *mut libc::statfs = std::ptr::null_mut();
+            // getmntinfo owns the buffer; it must not be freed
+            let n = unsafe { libc::getmntinfo(&mut ptr, libc::MNT_NOWAIT) };
+            if n <= 0 || ptr.is_null() {
+                return Vec::new();
+            }
+            let list = unsafe { std::slice::from_raw_parts(ptr, n as usize) };
+            let s = |a: &[libc::c_char]| unsafe { CStr::from_ptr(a.as_ptr()) }.to_string_lossy().into_owned();
+            list.iter()
+                .map(|f| mount_from_parts(&s(&f.f_mntonname), &s(&f.f_mntfromname), &s(&f.f_fstypename), f.f_flags))
+                .collect()
+        }
+
+        /// Pseudo filesystems that must never be scanned (they are not on any disk).
+        pub fn is_virtual_fs(fstype: &str) -> bool {
+            matches!(fstype, "devfs" | "autofs" | "nullfs" | "lifs" | "fdesc")
+        }
+
+        /// Mounts the scan never enters, even with "Other drives" on: pseudo
+        /// filesystems and hidden volumes (Time Machine snapshots, VM, Preboot).
+        pub fn is_virtual_mount(m: &Mount) -> bool {
+            is_virtual_fs(&m.fstype) || m.options.split(',').any(|o| o == "nobrowse")
+        }
+
+        /// Filesystems worth listing on the start screen: the root and every
+        /// real volume, but not the pieces of the system volume group.
+        pub fn is_listable_fs(m: &Mount) -> bool {
+            m.point == Path::new("/") || (!is_virtual_mount(m) && !m.point.starts_with("/System/Volumes"))
+        }
+
+        /// `/System/Volumes` holds the firmlinked halves of the system disk.
+        /// Scanning from above it would count the data volume twice.
+        pub fn is_system_volume_dir(scan_root: &Path, p: &Path) -> bool {
+            p.starts_with("/System/Volumes") && !scan_root.starts_with("/System/Volumes")
+        }
+
+        /// What `may_enter` answers when the device changes but no mount entry
+        /// exists: not entered.
+        pub const ENTER_UNLISTED_DEVICES: bool = false;
+
+        /// Run `/usr/bin/open` with the given arguments and wait for it.
+        /// No shell is involved and all output is discarded.
+        fn open_cmd(args: &[&std::ffi::OsStr]) -> bool {
+            Command::new("/usr/bin/open")
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        /// Open a file or folder with its default application.
+        pub fn open_path(p: &Path) {
+            let p = p.to_path_buf();
+            std::thread::spawn(move || {
+                open_cmd(&[p.as_os_str()]);
+            });
+        }
+
+        /// Reveal the item in Finder (`open -R`). Falls back to opening the
+        /// containing folder.
+        pub fn show_in_file_manager(p: &Path) {
+            let p = p.to_path_buf();
+            let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_else(|| p.clone());
+            std::thread::spawn(move || {
+                if !open_cmd(&["-R".as_ref(), p.as_os_str()]) {
+                    open_cmd(&[parent.as_os_str()]);
+                }
+            });
+        }
+
+        /// Open System Settings at Privacy & Security > Full Disk Access.
+        pub fn open_full_disk_access_settings() {
+            let mut cmd = Command::new("/usr/bin/open");
+            cmd.arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles");
+            run_detached(cmd);
+        }
+
+        /// Whether this process has Full Disk Access. The privacy database
+        /// can only be opened with it; the file is opened read-only and
+        /// closed right away. Any other error counts as access, so a missing
+        /// file never leads to asking for nothing.
+        pub fn has_full_disk_access() -> bool {
+            match std::fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db") {
+                Ok(_) => true,
+                Err(e) => e.kind() != std::io::ErrorKind::PermissionDenied,
+            }
+        }
+
+        /// Reveal Spacemapper.app in Finder, so it can be dragged into the
+        /// Full Disk Access list. Outside an app bundle the program itself
+        /// is shown.
+        pub fn reveal_app() {
+            let Ok(exe) = std::env::current_exe() else { return };
+            // Spacemapper.app/Contents/MacOS/spacemapper
+            let bundle = exe.ancestors().nth(3).filter(|p| p.extension().is_some_and(|e| e == "app"));
+            show_in_file_manager(bundle.unwrap_or(&exe));
+        }
+
+        /// Password dialog for `sudo -A` (see `scan::elevate`): prints the
+        /// password for sudo and returns the exit code. Cancel exits non-zero,
+        /// so sudo gives up.
+        pub fn askpass() -> i32 {
+            let script = "display dialog \"Spacemapper needs your password to scan as administrator. \
+                          It only reads names, sizes and dates; it does not modify or delete files.\" \
+                          default answer \"\" with hidden answer with title \"Spacemapper\" with icon caution \
+                          buttons {\"Cancel\", \"Scan\"} default button \"Scan\" cancel button \"Cancel\"\n\
+                          text returned of result";
+            Command::new("/usr/bin/osascript")
+                .args(["-e", script])
+                .stdin(Stdio::null())
+                .status()
+                .ok()
+                .and_then(|s| s.code())
+                .unwrap_or(1)
+        }
+
+        /// ~/Library/Application Support/Spacemapper
+        pub fn config_dir() -> PathBuf {
+            home_dir().join("Library/Application Support/Spacemapper")
+        }
+
+        /// Same folder as `config_dir`.
+        pub fn state_dir() -> PathBuf {
+            config_dir()
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn macos_mount_with_space_in_name() {
+                let m = mount_from_parts("/Volumes/My Passport", "/dev/disk8s1", "exfat", (libc::MNT_LOCAL) as u32);
+                assert_eq!(m.point, PathBuf::from("/Volumes/My Passport"));
+                assert_eq!(m.options, "rw,local");
+                assert!(is_listable_fs(&m));
+            }
+
+            #[test]
+            fn macos_nobrowse_is_virtual() {
+                let snap = mount_from_parts("/Volumes/.timemachine/D59A/2024-08-26-161316.backup", "com.apple.TimeMachine.2024-08-26-161316.backup@/dev/disk7s2", "apfs", (libc::MNT_RDONLY | libc::MNT_DONTBROWSE) as u32);
+                assert_eq!(snap.options, "ro,nobrowse");
+                assert!(is_virtual_mount(&snap));
+                assert!(!is_listable_fs(&snap));
+            }
+
+            #[test]
+            fn macos_listable_kinds() {
+                for fs in ["apfs", "hfs", "exfat", "msdos", "ntfs", "smbfs", "afpfs", "nfs", "webdav", "macfuse"] {
+                    assert!(is_listable_fs(&mount_from_parts("/Volumes/X", "src", fs, 0)), "{fs}");
+                }
+                assert!(is_listable_fs(&mount_from_parts("/", "/dev/disk3s1s1", "apfs", (libc::MNT_RDONLY | libc::MNT_LOCAL) as u32)));
+                assert!(!is_listable_fs(&mount_from_parts("/System/Volumes/Data", "/dev/disk3s5", "apfs", libc::MNT_LOCAL as u32)));
+                assert!(!is_listable_fs(&mount_from_parts("/System/Volumes/VM", "/dev/disk3s6", "apfs", (libc::MNT_LOCAL | libc::MNT_DONTBROWSE) as u32)));
+                assert!(!is_listable_fs(&mount_from_parts("/dev", "devfs", "devfs", 0)));
+            }
+
+            #[test]
+            fn macos_noatime_option() {
+                assert_eq!(mount_from_parts("/Volumes/X", "s", "apfs", (libc::MNT_NOATIME) as u32).options, "rw,noatime");
+            }
+
+            #[test]
+            fn system_volume_rule() {
+                let p = Path::new;
+                assert!(is_system_volume_dir(p("/"), p("/System/Volumes")));
+                assert!(is_system_volume_dir(p("/System"), p("/System/Volumes")));
+                assert!(is_system_volume_dir(p("/"), p("/System/Volumes/Data")));
+                assert!(!is_system_volume_dir(p("/System/Volumes/Data"), p("/System/Volumes/Data/Users")));
+                assert!(!is_system_volume_dir(p("/System/Volumes"), p("/System/Volumes/Data")));
+                assert!(!is_system_volume_dir(p("/"), p("/System/Library")));
+                assert!(!is_system_volume_dir(p("/Volumes/X"), p("/Volumes/X/System/Volumes")));
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    pub use macos::*;
 }
 
 // ======================================================================
@@ -490,6 +731,19 @@ mod imp {
         true
     }
 
+    /// Mounts the scan never enters, even with "Other drives" on.
+    pub fn is_virtual_mount(m: &Mount) -> bool {
+        is_virtual_fs(&m.fstype)
+    }
+
+    /// Directories the scan treats as mount points and does not enter.
+    pub fn is_system_volume_dir(_scan_root: &Path, _p: &Path) -> bool {
+        false
+    }
+
+    /// What `may_enter` answers when the device changes but no mount entry exists.
+    pub const ENTER_UNLISTED_DEVICES: bool = true;
+
     pub fn fs_space(p: &Path) -> Option<Space> {
         let w = wide(p);
         let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
@@ -533,6 +787,17 @@ mod imp {
     pub fn is_admin() -> bool {
         unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
     }
+
+    /// Only macOS has Full Disk Access; elsewhere the app never asks for it.
+    pub fn has_full_disk_access() -> bool {
+        true
+    }
+
+    /// Never called outside macOS (see `has_full_disk_access`).
+    pub fn open_full_disk_access_settings() {}
+
+    /// Never called outside macOS (see `has_full_disk_access`).
+    pub fn reveal_app() {}
 
     /// Start Spacemapper again with administrator rights (the UAC prompt),
     /// optionally scanning `path`. Returns true if the new copy started.

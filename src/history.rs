@@ -2,7 +2,8 @@
 //! Scan history for "changes since last scan".
 //!
 //! After a complete scan, the size of every folder (above a small minimum) is
-//! saved to ~/.local/state/spacemapper/history/. This is Spacemapper's own data;
+//! saved to ~/.local/state/spacemapper/history/ (macOS: ~/Library/Application
+//! Support/Spacemapper/history/). This is Spacemapper's own data;
 //! nothing is written next to the scanned files. The newest 10 summaries per
 //! scanned folder are kept.
 

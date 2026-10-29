@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Remembers view settings in ~/.config/spacemapper/settings.conf
-//! (on Windows: %APPDATA%\\Spacemapper\\settings.conf)
+//! (on Windows: %APPDATA%\\Spacemapper\\settings.conf, on macOS:
+//! ~/Library/Application Support/Spacemapper/settings.conf)
 //! (plain "key = value" lines).
 
 use super::*;
@@ -34,13 +35,17 @@ impl App {
             panel::Tab::Duplicates => "duplicates",
             panel::Tab::Changes => "changes",
         };
-        format!(
+        let mut text = format!(
             "# Spacemapper settings, written automatically\n\
              color = {color}\nage_date = {age}\nsize = {size}\ndetail = {}\ndepth = {}\n\
              show_free = {}\nshow_unknown = {}\nother_drives = {}\n\
              list = {}\nlist_tab = {tab}\nduplicates_min = {}\n",
             s.detail, s.depth, s.show_free, s.show_unknown, s.cross_fs, self.panel.open, self.dupes.min_idx
-        )
+        );
+        if cfg!(target_os = "macos") {
+            text.push_str(&format!("ask_full_disk_access = {}\n", s.ask_full_disk_access));
+        }
+        text
     }
 
     pub(super) fn load_prefs(&mut self) {
@@ -72,6 +77,7 @@ impl App {
                 "show_free" => s.show_free = b,
                 "show_unknown" => s.show_unknown = b,
                 "other_drives" => s.cross_fs = b,
+                "ask_full_disk_access" => s.ask_full_disk_access = b,
                 "list" => self.panel.open = b,
                 "list_tab" => {
                     self.panel.tab = match v {

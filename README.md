@@ -4,7 +4,7 @@
 
 <h1 align="center">Spacemapper</h1>
 
-<p align="center">Disk usage viewer for Linux and Windows that shows your files as a treemap.</p>
+<p align="center">Disk usage viewer for Linux, Windows and macOS that shows your files as a treemap.</p>
 
 <p align="center">
   <a href="https://github.com/Martin-ii/spacemapper/releases/latest">Download</a> ·
@@ -30,11 +30,11 @@ It works like SpaceSniffer. Spacemapper only reads your files: it has no option 
 - Colors by top-level folder, file type or age, or plain grayscale
 - Free space and unreadable space shown when scanning a whole drive
 - Full access option to include system folders (asks for your administrator password)
-- Open files or show them in your file manager (or Explorer) from the right-click menu
+- Open files or show them in your file manager (Explorer on Windows, Finder on macOS) from the right-click menu
 - Fast multithreaded scanning; sizes match `du`
 - JSON output (`spacemapper --json FOLDER`) for scripts and other programs
 - Remembers your view settings
-- Runs on Linux (Wayland and X11) and Windows 10 and 11
+- Runs on Linux (Wayland and X11), Windows 10 and 11, and macOS on Apple Silicon
 
 | Duplicates | Changes since an earlier scan |
 |---|---|
@@ -46,13 +46,25 @@ It works like SpaceSniffer. Spacemapper only reads your files: it has no option 
 
 ## Installation
 
-Spacemapper runs on 64-bit (x86_64) Linux with glibc 2.28 or newer, which covers every distribution released since 2019, and on 64-bit Windows 10 and 11.
+Spacemapper runs on 64-bit (x86_64) Linux with glibc 2.28 or newer, which covers every distribution released since 2019, on 64-bit Windows 10 and 11, and on macOS with Apple Silicon.
 
 ### Windows
 
 Download `Spacemapper-VERSION-windows-x64.exe` from the [Releases](https://github.com/Martin-ii/spacemapper/releases/latest) page and double-click it. Nothing is installed: it is a single program file that you can keep anywhere, for example in your Documents folder. To have it in the Start menu, right-click the file and choose **Pin to Start**. To remove Spacemapper, delete the file.
 
 The program is not signed, so the first time you start it Windows may show "Windows protected your PC". Click **More info**, then **Run anyway**.
+
+### macOS
+
+Download `Spacemapper-VERSION-macos-arm64.zip` from the [Releases](https://github.com/Martin-ii/spacemapper/releases/latest) page and double-click it to unpack it. Drag `Spacemapper.app` into your Applications folder. It runs on Macs with Apple Silicon (M1 and newer). To remove Spacemapper, delete the app.
+
+The app is not notarized, so the first time you start it macOS refuses to open it. Open the app once and close the warning. Then open **System Settings**, **Privacy & Security**, scroll down to the **Security** section, click **Open Anyway** and confirm (it may ask for your password).
+
+On its first start, Spacemapper offers to open the **Full Disk Access** settings. Turn on Spacemapper there and start it again, so it can include folders such as Mail and Photos (see [Full access](#full-access)).
+
+On an external display, a full-screen or maximized Spacemapper window sometimes ignores a click, and a second click works. This comes from the window library ([winit issue #4295](https://github.com/rust-windowing/winit/issues/4295)). A normal-sized window on the same display is not affected.
+
+To build the app yourself, see [Building from source](#building-from-source).
 
 ### Linux: quick install
 
@@ -183,12 +195,12 @@ On the start screen, click **Scan** next to a drive, or enter a folder path. You
 | Jump to a parent folder | Click it in the path bar | |
 | Select an item | Click | |
 | Context menu | Right-click | |
-| Show in file manager | Middle-click | |
+| Show in file manager (Finder on macOS) | Middle-click | |
 | Rescan | Rescan button | F5 |
 | Show or hide the side list | List button | L |
-| Focus the filter box | | Ctrl+F |
+| Focus the filter box | | Ctrl+F (Cmd+F on macOS) |
 
-The right-click menu has: Show in file manager, Open, Zoom in, Zoom out, Copy path, Copy name and Rescan this folder.
+The right-click menu has: Show in file manager (Show in Finder on macOS), Open, Zoom in, Zoom out, Copy path, Copy name and Rescan this folder.
 
 ### Toolbar
 
@@ -269,11 +281,13 @@ On Windows, **Added** uses the date the file was created on this drive, which is
 When you scan a whole drive, two extra boxes appear:
 
 - **Free space** is the space still available on the drive.
-- **Unknown** is used space that the scan could not read. This is mostly system folders that your user has no permission to open, plus btrfs snapshots and filesystem metadata.
+- **Unknown** is used space that the scan could not read. This is mostly system folders that your user has no permission to open, plus btrfs snapshots and filesystem metadata. On macOS it also includes the hidden Preboot and Recovery volumes.
 
 ### Full access
 
 On Windows, click **Restart as administrator** on the start screen, or **Rescan with full access** in the status bar after a scan. Windows asks for permission and Spacemapper starts again with administrator rights. Other users' folders and protected system folders are then included.
+
+On macOS, two kinds of protection apply. Folders such as Mail, Messages and Photos need **Full Disk Access**: open **System Settings**, **Privacy & Security**, **Full Disk Access**, turn on Spacemapper and start it again. The start screen has a button that opens this page. Other users' folders and some system folders also need administrator rights: turn on **Full access** on the start screen, or click **Rescan with full access** in the status bar after a scan. Spacemapper asks for your password, and only the scanning part runs with administrator rights. With both, everything except the hidden system volumes is counted.
 
 On Linux, some folders, such as `/root` and parts of `/var`, can only be read by the administrator. To include them, turn on **Full access** on the start screen before scanning, or click **Rescan with full access** in the status bar after a scan.
 
@@ -311,7 +325,7 @@ Spacemapper never changes your files. It writes only these:
 | `~/.config/spacemapper/settings.conf` | view settings (colors, detail, side list tab) |
 | `~/.local/state/spacemapper/history/` | folder size summaries for the Changes tab, the last 10 per scanned folder |
 
-On Windows the same files are in `%APPDATA%\Spacemapper\settings.conf` and `%LOCALAPPDATA%\Spacemapper\history\`.
+On Windows the same files are in `%APPDATA%\Spacemapper\settings.conf` and `%LOCALAPPDATA%\Spacemapper\history\`. On macOS both are in `~/Library/Application Support/Spacemapper/`.
 
 Delete either at any time to reset it.
 
@@ -323,6 +337,7 @@ Delete either at any time to reset it.
 - Btrfs subvolumes on the same drive, such as `@` and `@home`, are treated as one filesystem, so scanning `/` includes `/home`.
 - Btrfs snapshot folders (`.snapshots` and Timeshift) are skipped, because snapshots share most of their data with the live system and would otherwise be counted several times.
 - Virtual filesystems such as `/proc` and `/sys` are never scanned.
+- On macOS, `/System/Volumes` is skipped when scanning `/`: its Data volume holds the same files as `/Users`, `/Applications` and the other top-level folders, so it would count them twice. Time Machine snapshots are never scanned. APFS clones (copies made with Finder's Duplicate or `cp -c`) share their data on disk, but every copy is counted at its full size.
 - On Windows, sizes on disk are rounded up to whole 4 KB clusters, and OneDrive files that are only stored online count as 0. Junctions and symbolic links (such as `C:\Documents and Settings`) are not followed. NTFS compression and hard links are not taken into account, so a compressed folder shows its full size.
 
 ## Building from source
@@ -349,6 +364,8 @@ cargo build --release
 
 On Windows, install Rust with [rustup](https://rustup.rs) (it also sets up the Visual Studio Build Tools it needs), then run the same `git clone` and `cargo build --release` commands in a terminal. The program is `target\release\spacemapper.exe`.
 
+On macOS, install the Xcode command line tools (`xcode-select --install`) and Rust with [rustup](https://rustup.rs), then run `bash packaging/macos/build-app.sh` in the cloned folder. It builds `dist/Spacemapper.app`, which you can copy to your Applications folder, and `dist/Spacemapper-VERSION-macos-arm64.zip`. An app you built yourself opens without the "Open Anyway" step. After every rebuild, macOS may ask you to turn on Full Disk Access again.
+
 ### Arch package from source
 
 ```sh
@@ -359,7 +376,7 @@ makepkg -si
 
 ### Release packages
 
-`packaging/build-packages.sh` builds the AppImage, .deb, .rpm, Arch package and tar.gz into `dist/`. It needs `cargo-zigbuild` with `zig` (used to build a binary that runs on older glibc versions), `cargo-generate-rpm`, `dpkg-deb`, `appimagetool` and Python with the `zstandard` module. The GitHub Actions workflow in `.github/workflows/release.yml` runs this script, tests the packages on Debian 12 and 13, Ubuntu 22.04 and 24.04, Fedora, openSUSE and Arch, and builds and tests the Windows program on Windows.
+`packaging/build-packages.sh` builds the AppImage, .deb, .rpm, Arch package and tar.gz into `dist/`. It needs `cargo-zigbuild` with `zig` (used to build a binary that runs on older glibc versions), `cargo-generate-rpm`, `dpkg-deb`, `appimagetool` and Python with the `zstandard` module. The GitHub Actions workflow in `.github/workflows/release.yml` runs this script, tests the packages on Debian 12 and 13, Ubuntu 22.04 and 24.04, Fedora, openSUSE and Arch, builds and tests the Windows program on Windows, and builds and tests the macOS app on macOS.
 
 ## License
 

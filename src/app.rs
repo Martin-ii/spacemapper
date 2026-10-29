@@ -88,6 +88,8 @@ struct Settings {
     age_date: DateKind,
     cross_fs: bool,
     full_access: bool,
+    /// macOS: show the Full Disk Access window at launch when access is missing
+    ask_full_disk_access: bool,
 }
 
 // ------------------------------------------------------------------ cache
@@ -187,6 +189,10 @@ pub struct App {
     logo: egui::TextureHandle,
     menu_from_list: bool,
     list_menu_response: Option<Response>,
+    /// macOS: whether Full Disk Access was granted (checked at launch)
+    full_disk_access: bool,
+    /// macOS: the Full Disk Access window is open
+    access_prompt: bool,
 }
 
 impl App {
@@ -222,6 +228,7 @@ impl App {
                 age_date: DateKind::Added,
                 cross_fs: false,
                 full_access: false,
+                ask_full_disk_access: true,
             },
             filter_text: String::new(),
             filter_applied: String::new(),
@@ -247,8 +254,12 @@ impl App {
             ),
             menu_from_list: false,
             list_menu_response: None,
+            full_disk_access: true,
+            access_prompt: false,
         };
         app.load_prefs();
+        app.full_disk_access = util::has_full_disk_access();
+        app.access_prompt = !app.full_disk_access && app.settings.ask_full_disk_access;
         app.refresh_mounts(&cc.egui_ctx);
         if let Some(p) = start {
             app.path_input = p.to_string_lossy().into_owned();
@@ -276,7 +287,8 @@ impl App {
 
     /// Whether scans run with administrator rights. On Linux each full-access
     /// scan asks for the password through pkexec; on Windows the whole program
-    /// runs as administrator after "Restart as administrator".
+    /// runs as administrator after "Restart as administrator". macOS asks
+    /// through sudo like pkexec; protected folders also need Full Disk Access.
     fn elevated(&self) -> bool {
         if cfg!(windows) { util::is_admin() } else { self.settings.full_access }
     }
@@ -287,6 +299,54 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             self.toast("Could not restart as administrator".to_string());
+        }
+    }
+
+    /// macOS: explain Full Disk Access once per launch while it is missing.
+    /// macOS has no system prompt for it; the user switches it on in
+    /// System Settings, where Spacemapper.app can be dragged into the list.
+    fn access_window(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let r = egui::Modal::new(egui::Id::new("full_disk_access")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.label(RichText::new(format!("{}  Allow Full Disk Access", icon::SHIELD_CHECK)).color(TEXT).font(font_bold(16.0)));
+            ui.label(
+                RichText::new(
+                    "To show everything on your disk, including Mail, Messages and other protected folders, \
+                     Spacemapper needs Full Disk Access. Spacemapper only reads files; it does not modify or delete them.",
+                )
+                .size(12.5)
+                .color(TEXT_DIM),
+            );
+            ui.label(
+                RichText::new("In System Settings, switch on Spacemapper. If it is not in the list, drag Spacemapper.app from Finder into it. Then restart Spacemapper.")
+                    .size(12.5)
+                    .color(TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let open = egui::Button::new(RichText::new("Open System Settings").size(12.5).color(ACCENT))
+                    .fill(SURFACE2)
+                    .corner_radius(CornerRadius::same(8));
+                if ui.add(open).clicked() {
+                    util::open_full_disk_access_settings();
+                    close = true;
+                }
+                if ui.button("Show Spacemapper.app in Finder").clicked() {
+                    util::reveal_app();
+                }
+                if ui.button("Not now").clicked() {
+                    close = true;
+                }
+                if ui.button("Don't ask again").clicked() {
+                    self.settings.ask_full_disk_access = false;
+                    close = true;
+                }
+            });
+        });
+        if close || r.should_close() {
+            self.access_prompt = false;
         }
     }
 
@@ -489,11 +549,11 @@ impl App {
                 i.pointer.button_pressed(PointerButton::Extra2) || (m.alt && i.key_pressed(Key::ArrowRight)),
                 (m.alt && i.key_pressed(Key::ArrowUp)) || (!typing && i.key_pressed(Key::U)),
                 !typing && i.key_pressed(Key::Home),
-                !typing && !m.ctrl && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
-                !typing && !m.ctrl && i.key_pressed(Key::Minus),
+                !typing && !m.command && (i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals)),
+                !typing && !m.command && i.key_pressed(Key::Minus),
                 !typing && i.key_pressed(Key::Enter),
                 i.key_pressed(Key::F5),
-                m.ctrl && i.key_pressed(Key::F),
+                m.command && i.key_pressed(Key::F),
                 !typing && i.key_pressed(Key::L),
                 !typing && i.key_pressed(Key::CloseBracket),
                 !typing && i.key_pressed(Key::OpenBracket),
@@ -549,6 +609,8 @@ impl App {
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
+            // resolve links like a typed path (/Volumes/Macintosh HD is /)
+            let p = util::absolute(&p);
             let dir = if p.is_dir() { p } else { p.parent().map(Path::to_path_buf).unwrap_or(p) };
             self.path_input = dir.to_string_lossy().into_owned();
             self.begin_scan(dir, ctx);
@@ -975,7 +1037,7 @@ impl App {
 
         // mouse wheel: step in / out
         if response.hovered() {
-            let dy = ui.ctx().input(|i| if i.modifiers.ctrl { 0.0 } else { i.raw_scroll_delta.y });
+            let dy = ui.ctx().input(|i| if i.modifiers.command { 0.0 } else { i.raw_scroll_delta.y });
             self.scroll_acc += dy;
             if self.scroll_acc > 60.0 {
                 self.scroll_acc = 0.0;
@@ -1099,7 +1161,7 @@ impl App {
             ui.separator();
             let item = |ui: &mut Ui, ic: &str, text: &str| ui.button(format!("{ic}   {text}")).clicked();
             if !pseudo {
-                if item(ui, icon::FOLDER_OPEN, if cfg!(windows) { "Show in Explorer" } else { "Show in file manager" }) {
+                if item(ui, icon::FOLDER_OPEN, if cfg!(windows) { "Show in Explorer" } else if cfg!(target_os = "macos") { "Show in Finder" } else { "Show in file manager" }) {
                     action = Some(Action::Reveal);
                 }
                 if item(ui, icon::ARROW_SQUARE_OUT, if is_dir { "Open folder" } else { "Open file" }) {
@@ -1273,6 +1335,30 @@ fn level_dots(ui: &mut Ui, value: &mut usize, count: usize) -> bool {
         painter.circle_filled(c, r, if on { ACCENT } else { SURFACE3 });
     }
     changed
+}
+
+/// Busy indicator like egui's Spinner, but it asks for about 30 frames per
+/// second. egui's asks for a new frame every frame, which a hidden window
+/// (no vsync) turns into hundreds of frames per second.
+fn spinner(ui: &mut Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    // egui subtracts the expected frame time (about 16 ms) from the delay
+    ui.ctx().request_repaint_after(Duration::from_millis(33));
+    let radius = size / 2.0 - 2.0;
+    let n = (radius.round() as u32).clamp(8, 128);
+    let time = ui.input(|i| i.time);
+    let start = time * std::f64::consts::TAU;
+    let end = start + 240f64.to_radians() * time.sin();
+    let points: Vec<Pos2> = (0..n)
+        .map(|i| {
+            let a = start + (end - start) * i as f64 / n as f64;
+            rect.center() + radius * vec2(a.cos() as f32, a.sin() as f32)
+        })
+        .collect();
+    ui.painter().add(egui::Shape::line(points, Stroke::new(3.0_f32, ACCENT)));
 }
 
 /// iOS-style switch
@@ -1546,7 +1632,7 @@ impl App {
             (icon::FILE_ZIP, "Archives", "*.zip;*.7z;*.rar;*.tar;*.gz;*.tgz;*.xz;*.zst;*.bz2;*.lz4"),
             (icon::DISC, "Disk and VM images", "*.iso;*.img;*.qcow2;*.vdi;*.vmdk;*.vhd;*.vhdx;*.raw.xz"),
         ];
-        #[cfg(not(windows))]
+        #[cfg(all(unix, not(target_os = "macos")))]
         const CLEANUP: &[Preset] = &[
             (icon::BROOM, "Caches", "/.cache/;/cache/;/caches/"),
             (icon::GAME_CONTROLLER, "Shader caches", "/mesa_shader_cache/;/mesa_shader_cache_db/;/shadercache/;/.nv/;/nvidia/glcache/;/dxvk-cache/;/vkd3d-proton.cache"),
@@ -1558,7 +1644,7 @@ impl App {
             (icon::BUG, "Crash dumps", "/var/lib/systemd/coredump/;/var/crash/"),
             (icon::TRASH, "Trash", "/.local/share/trash/"),
         ];
-        #[cfg(not(windows))]
+        #[cfg(all(unix, not(target_os = "macos")))]
         const APPS: &[Preset] = &[
             (icon::GAME_CONTROLLER, "Steam games", "/steamapps/"),
             (icon::GAME_CONTROLLER, "Wine and Proton prefixes", "/compatdata/;/.wine/;/pfx/drive_c/"),
@@ -1566,6 +1652,25 @@ impl App {
             (icon::PACKAGE, "Snap packages", "/var/lib/snapd/;/snap/"),
             (icon::CUBE, "Containers (Docker, Podman)", "/var/lib/docker/;/var/lib/containers/;/.local/share/containers/"),
             (icon::DESKTOP, "Virtual machines", "/var/lib/libvirt/;/virtualbox vms/;/.local/share/gnome-boxes/;*.qcow2;*.vdi;*.vmdk"),
+        ];
+        #[cfg(target_os = "macos")]
+        const CLEANUP: &[Preset] = &[
+            (icon::BROOM, "Caches", "/library/caches/"),
+            (icon::GLOBE, "Browser caches", "/library/caches/com.apple.safari/;/library/caches/google/chrome/;/library/caches/firefox/;/library/caches/microsoft edge/;/library/caches/bravesoftware/"),
+            (icon::CODE, "Xcode", "/library/developer/xcode/deriveddata/;/library/developer/xcode/archives/;/library/developer/xcode/ios devicesupport/;/library/developer/coresimulator/"),
+            (icon::HARD_DRIVE, "iOS backups", "/library/application support/mobilesync/backup/"),
+            (icon::PACKAGE, "Package caches", "/library/caches/homebrew/;/.cargo/registry/;/.npm/;/library/caches/pip/;/.gradle/caches/;/.m2/repository/"),
+            (icon::CODE, "Build and dependency folders", "/node_modules/;/target/;/__pycache__/;/.venv/;/venv/;/build/;/.gradle/;/dist/"),
+            (icon::SCROLL, "Logs", "*.log;/library/logs/;/private/var/log/"),
+            (icon::BUG, "Crash reports", "/library/logs/diagnosticreports/"),
+            (icon::TRASH, "Trash", "/.trash/"),
+        ];
+        #[cfg(target_os = "macos")]
+        const APPS: &[Preset] = &[
+            (icon::GAME_CONTROLLER, "Steam games", "/library/application support/steam/steamapps/"),
+            (icon::CUBE, "Docker Desktop", "/library/containers/com.docker.docker/"),
+            (icon::DESKTOP, "Virtual machines", "/library/containers/com.utmapp.utm/;/parallels/;*.vmwarevm;*.utm;*.pvm"),
+            (icon::FILE_TEXT, "Mail and Messages attachments", "/library/mail/;/library/messages/attachments/"),
         ];
         #[cfg(windows)]
         const CLEANUP: &[Preset] = &[
@@ -1676,7 +1781,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 18.0;
             if let Some(job) = &self.job {
-                ui.add(egui::Spinner::new().size(14.0).color(ACCENT));
+                spinner(ui, 14.0);
                 stat(ui, icon::ARROWS_CLOCKWISE, format!("Rescanning {}  ·  {}", job.path.display(), util::count_of(job.progress.files.load(Relaxed), "file")));
                 if ui.small_button("Cancel").clicked() {
                     job.progress.cancel.store(true, Relaxed);
@@ -1719,6 +1824,14 @@ impl App {
                             .corner_radius(CornerRadius::same(8));
                         let tip = if cfg!(windows) { "Restarts Spacemapper as administrator" } else { "Requires administrator password" };
                         rescan_full = ui.add(b).on_hover_text(tip).clicked();
+                    }
+                    if cfg!(target_os = "macos") && !self.full_disk_access {
+                        let b = egui::Button::new(RichText::new(format!("{}  Open Full Disk Access settings", icon::LOCK_SIMPLE)).size(12.5).color(ACCENT))
+                            .fill(SURFACE2)
+                            .corner_radius(CornerRadius::same(8));
+                        if ui.add(b).on_hover_text("Allow Spacemapper in System Settings, then restart Spacemapper").clicked() {
+                            util::open_full_disk_access_settings();
+                        }
                     }
                 }
                 if rescan_full {
@@ -1805,9 +1918,39 @@ impl App {
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 1.0;
                                         ui.label(RichText::new(format!("{}  Full access", icon::SHIELD_CHECK)).color(TEXT).font(font_bold(13.5)));
-                                        ui.label(RichText::new("Scan as administrator so system folders are included. Asks for your password.").size(12.0).color(TEXT_DIM));
+                                        let text = if cfg!(target_os = "macos") {
+                                            "Scan as administrator so system folders and other users' files are included. Asks for your password."
+                                        } else {
+                                            "Scan as administrator so system folders are included. Asks for your password."
+                                        };
+                                        ui.label(RichText::new(text).size(12.0).color(TEXT_DIM));
                                     });
                                 });
+                                if cfg!(target_os = "macos") {
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.spacing_mut().item_spacing.y = 1.0;
+                                            ui.label(RichText::new(format!("{}  Full Disk Access", icon::LOCK_SIMPLE)).color(TEXT).font(font_bold(13.5)));
+                                            let text = if self.full_disk_access {
+                                                "Full Disk Access is on. Protected folders such as Mail and Messages are included."
+                                            } else {
+                                                "macOS hides some folders, such as Mail and Messages, unless Spacemapper has Full Disk Access."
+                                            };
+                                            ui.label(RichText::new(text).size(12.0).color(TEXT_DIM));
+                                        });
+                                        if !self.full_disk_access {
+                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                let b = egui::Button::new(RichText::new(format!("{}  Open Full Disk Access settings", icon::SHIELD_CHECK)).size(12.5).color(ACCENT))
+                                                    .fill(SURFACE2)
+                                                    .corner_radius(CornerRadius::same(8));
+                                                if ui.add(b).clicked() {
+                                                    util::open_full_disk_access_settings();
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
                             }
                             ui.add_space(6.0);
                             #[cfg(unix)]
@@ -1944,7 +2087,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(width);
                     ui.vertical_centered(|ui| {
-                        ui.add(egui::Spinner::new().size(30.0).color(ACCENT));
+                        spinner(ui, 30.0);
                         ui.add_space(10.0);
                         let title = if job.elevated { format!("{}  Scanning (full access)", icon::SHIELD_CHECK) } else { "Scanning".to_string() };
                         ui.label(RichText::new(title).font(font_bold(18.0)).color(TEXT));
@@ -2037,6 +2180,10 @@ impl eframe::App for App {
         }
         if self.toast.as_ref().map(|t| t.1.elapsed() < Duration::from_secs(3)).unwrap_or(false) {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+
+        if self.access_prompt {
+            self.access_window(ctx);
         }
 
         let bg = egui::Frame::new().fill(BG);

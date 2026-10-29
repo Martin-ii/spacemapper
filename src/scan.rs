@@ -63,6 +63,7 @@ struct Ctx {
     root_source: String,
     root_fstype: String,
     cross: bool,
+    root: PathBuf,
 }
 
 impl Ctx {
@@ -70,7 +71,7 @@ impl Ctx {
     fn may_enter(&self, p: &Path) -> bool {
         match self.mounts.get(p) {
             Some(m) => {
-                if util::is_virtual_fs(&m.fstype) {
+                if util::is_virtual_mount(m) {
                     false
                 } else if self.cross {
                     true
@@ -79,8 +80,9 @@ impl Ctx {
                     m.source == self.root_source && m.fstype == self.root_fstype
                 }
             }
-            // device changed without a mount entry: nested btrfs subvolume
-            None => true,
+            // device changed without a mount entry: a nested btrfs subvolume on
+            // Linux; the platform decides (see `util::ENTER_UNLISTED_DEVICES`)
+            None => util::ENTER_UNLISTED_DEVICES,
         }
     }
 }
@@ -112,6 +114,7 @@ pub fn scan(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanOutput {
         root_source,
         root_fstype,
         cross,
+        root: path.to_path_buf(),
     };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let pool = rayon::ThreadPoolBuilder::new()
@@ -226,7 +229,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: Box<str>, md: &fs::Metadata) -> TNode 
                     flags: F_SNAPSHOTS,
                     children: Vec::new(),
                 }
-            } else if sm.dev != dev && !ctx.may_enter(&sp) {
+            } else if util::is_system_volume_dir(&ctx.root, &sp) || (sm.dev != dev && !ctx.may_enter(&sp)) {
                 p.skipped_mounts.fetch_add(1, Relaxed);
                 TNode {
                     name: sname,
@@ -257,7 +260,8 @@ fn is_snapshot_dir(name: &str, ino: u64) -> bool {
 // ---------------------------------------------------------------- full access
 //
 // For a "full access" scan the GUI starts a second copy of this program via
-// `pkexec` (the system password prompt). That copy only runs the read-only
+// `pkexec` (the system password prompt; on macOS `sudo` with a password
+// dialog, see `elevate`). That copy only runs the read-only
 // scanner above and streams the result back through a pipe; it never writes
 // any file. The GUI itself keeps running as your normal user.
 
@@ -393,14 +397,10 @@ pub fn scan_elevated(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanO
     scan(path, cross, progress)
 }
 
-/// Run a scan through `pkexec` with administrator rights. Blocks until done.
-#[cfg(unix)]
-pub fn scan_elevated(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanOutput {
-    let fail = |msg: String| ScanOutput { root: None, error: Some(msg), cancelled: false };
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => return fail(format!("Could not locate the spacemapper executable: {e}")),
-    };
+/// The command that starts this program with administrator rights:
+/// `pkexec`, which shows the system password prompt.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn elevate(exe: &Path) -> Command {
     let mut cmd = Command::new("pkexec");
     // Inside an AppImage the running binary lives on a FUSE mount that only
     // the current user can access, so root has to start the AppImage file
@@ -410,16 +410,41 @@ pub fn scan_elevated(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanO
             cmd.arg(appimage).arg("--appimage-extract-and-run");
         }
         _ => {
-            cmd.arg(&exe);
+            cmd.arg(exe);
         }
     }
+    cmd
+}
+
+/// macOS has no pkexec. `sudo -A` asks for the password through the program
+/// in SUDO_ASKPASS, which is this program again: with SPACEMAPPER_ASKPASS
+/// set it only shows a password dialog (see `util::askpass`). `-k` asks
+/// every time, like pkexec.
+#[cfg(target_os = "macos")]
+fn elevate(exe: &Path) -> Command {
+    let mut cmd = Command::new("/usr/bin/sudo");
+    cmd.env("SUDO_ASKPASS", exe).env("SPACEMAPPER_ASKPASS", "1");
+    cmd.args(["-A", "-k", "--"]).arg(exe);
+    cmd
+}
+
+/// Run a scan through `pkexec` (macOS: `sudo`) with administrator rights.
+/// Blocks until done.
+#[cfg(unix)]
+pub fn scan_elevated(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanOutput {
+    let fail = |msg: String| ScanOutput { root: None, error: Some(msg), cancelled: false };
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return fail(format!("Could not locate the spacemapper executable: {e}")),
+    };
+    let mut cmd = elevate(&exe);
     cmd.arg("--scan-helper").arg(path);
     if cross {
         cmd.arg("--cross");
     }
     let mut child = match cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
         Ok(c) => c,
-        Err(e) => return fail(format!("Could not start pkexec: {e}")),
+        Err(e) => return fail(format!("Could not start {}: {e}", if cfg!(target_os = "macos") { "sudo" } else { "pkexec" })),
     };
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
@@ -486,8 +511,10 @@ pub fn scan_elevated(path: &Path, cross: bool, progress: Arc<Progress>) -> ScanO
             let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
             let detail = last_err.lock().map(|e| e.clone()).unwrap_or_default();
             let msg = match code {
-                126 => "Authentication cancelled.".to_string(),
-                127 => "Authentication failed. A polkit agent (e.g. hyprpolkitagent) must be running.".to_string(),
+                126 if cfg!(not(target_os = "macos")) => "Authentication cancelled.".to_string(),
+                127 if cfg!(not(target_os = "macos")) => "Authentication failed. A polkit agent (e.g. hyprpolkitagent) must be running.".to_string(),
+                // sudo itself failed: "no password was provided", "incorrect password attempts"
+                1 if cfg!(target_os = "macos") && detail.starts_with("sudo:") => "Authentication cancelled or failed.".to_string(),
                 _ if !detail.is_empty() => detail,
                 _ => format!("Scan failed (exit code {code})."),
             };

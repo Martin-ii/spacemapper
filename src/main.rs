@@ -25,6 +25,12 @@ pub const APP_NAME: &str = "Spacemapper";
 pub const APP_ID: &str = "spacemapper";
 
 fn main() -> eframe::Result<()> {
+    // started by sudo as its password dialog (macOS full-access scan); the
+    // privileged helper itself never asks
+    #[cfg(target_os = "macos")]
+    if std::env::var_os("SPACEMAPPER_ASKPASS").is_some() && std::env::args().nth(1).as_deref() != Some("--scan-helper") {
+        std::process::exit(util::askpass());
+    }
     let mut start: Option<PathBuf> = None;
     if std::env::args().len() > 1 {
         util::attach_console();
@@ -47,7 +53,7 @@ fn main() -> eframe::Result<()> {
                 return Ok(());
             }
             "--scan-helper" => {
-                // privileged read-only scanner started by the GUI via pkexec
+                // privileged read-only scanner started by the GUI via pkexec (macOS: sudo)
                 let args: Vec<String> = std::env::args().collect();
                 let Some(p) = args.get(2) else { std::process::exit(2) };
                 let cross = args.iter().any(|a| a == "--cross");
@@ -87,6 +93,8 @@ fn main() -> eframe::Result<()> {
                 println!("{APP_NAME} {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            // macOS may add a process serial number when Finder starts the app
+            _ if cfg!(target_os = "macos") && a.starts_with("-psn_") => {}
             _ => {
                 let p = PathBuf::from(&a);
                 start = Some(util::absolute(&p));
@@ -108,8 +116,9 @@ fn main() -> eframe::Result<()> {
         // Don't block on the compositor when presenting a frame. With vsync on,
         // a window on a hidden Wayland workspace never gets its frame callback,
         // so a repaint there would hang the event loop and the compositor would
-        // report the app as not responding.
-        vsync: false,
+        // report the app as not responding. macOS keeps vsync: without it,
+        // the scan spinner and tooltips redraw as fast as the machine allows.
+        vsync: cfg!(target_os = "macos"),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -118,10 +127,15 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| Ok(Box::new(app::App::new(cc, start)))),
     );
     if let Err(e) = &result {
+        let needs = if cfg!(target_os = "macos") {
+            "It needs OpenGL 2 or newer."
+        } else {
+            "It needs a graphical session (Wayland or X11) and OpenGL 2 or newer\n\
+             (Mesa or your graphics driver)."
+        };
         eprintln!(
             "{APP_NAME} could not open its window: {e}\n\n\
-             It needs a graphical session (Wayland or X11) and OpenGL 2 or newer\n\
-             (Mesa or your graphics driver). To scan without a window, use:\n  \
+             {needs} To scan without a window, use:\n  \
              spacemapper --json FOLDER"
         );
     }
